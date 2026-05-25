@@ -154,9 +154,10 @@ function applyAuthState() {
   document.querySelectorAll(".employee-only").forEach(el => el.classList.toggle("is-hidden", state.user.role === "admin"));
 
   const activeView = document.querySelector(".view.is-active")?.id;
-  if (state.user.role === "admin" && ["employeeView", "reportsView"].includes(activeView)) {
+  const isAdmin = state.user.role === "admin";
+  if (isAdmin && ["employeeView", "reportsView"].includes(activeView)) {
     activateView("adminView");
-  } else if (state.user.role !== "admin" && activeView === "adminView") {
+  } else if (!isAdmin && ["adminView", "usersView"].includes(activeView)) {
     activateView("employeeView");
   }
 }
@@ -552,6 +553,7 @@ async function changePassword(event) {
     showToast("Senha alterada com sucesso.");
     await loadApp();
     dom.changePasswordForm.reset();
+    activateView(state.user.role === "admin" ? "adminView" : "employeeView");
   } catch (err) {
     dom.changePasswordMessage.textContent = err.message;
   }
