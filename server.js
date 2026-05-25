@@ -1,85 +1,47 @@
 "use strict";
 
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
+const { Pool } = require("pg");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const crypto = require("crypto");
+const path = require("path");
 
 const PORT = Number(process.env.PORT || 3000);
-const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
-const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
-const DB_FILE = path.join(DATA_DIR, "db.json");
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 
-const INITIAL_USERS = [
-  { username: "admin", password: "admin123", name: "Administrador", role: "admin" },
-  { username: "colaborador", password: "123456", name: "Colaborador", role: "employee" }
-];
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-const DEFAULT_DB = {
-  companies: ["CBS", "Cobase", "G&A", "Outra empresa"],
-  projects: ["Administrativo", "Artesano", "Obra Centro", "Obra Industrial", "Polimix", "Smartfit"],
-  users: [],
-  sessions: [],
-  nextExpenseNumber: 1,
-  nextReportNumber: 1,
-  expenses: [],
-  reports: []
-};
-
-// ---------------------------------------------------------------------------
-// Storage helpers (idêntico ao original)
-// ---------------------------------------------------------------------------
-function ensureStorage() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(migrateDb(DEFAULT_DB), null, 2));
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
   }
-}
+});
+
+const R2_BUCKET = process.env.R2_BUCKET_NAME;
+const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;
+
+const app = express();
+app.use(express.json({ limit: "35mb" }));
+app.use(express.static(path.join(__dirname, "public")));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function nowIso() { return new Date().toISOString(); }
 
 function hashPassword(password, salt) {
   return crypto.createHash("sha256").update(`${salt}:${password}`).digest("hex");
 }
 
-function makeUser({ username, password, name, role }) {
-  const salt = crypto.randomBytes(12).toString("hex");
-  return { id: crypto.randomUUID(), username, name, role, passwordSalt: salt, passwordHash: hashPassword(password, salt), createdAt: nowIso() };
+function formatReportCode(number) {
+  return `Pedido de Reembolso ${String(number).padStart(2, "0")}`;
 }
-
-function uniqueNames(items) {
-  const seen = new Set();
-  return items.map(item => String(item || "").trim()).filter(item => {
-    const key = item.toLowerCase();
-    if (!item || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function migrateDb(input) {
-  const db = { ...DEFAULT_DB, ...input, companies: Array.isArray(input.companies) ? input.companies : DEFAULT_DB.companies, projects: Array.isArray(input.projects) ? input.projects : DEFAULT_DB.projects, users: Array.isArray(input.users) ? input.users : [], sessions: Array.isArray(input.sessions) ? input.sessions : [], expenses: Array.isArray(input.expenses) ? input.expenses : [], reports: Array.isArray(input.reports) ? input.reports : [] };
-  db.companies = uniqueNames(db.companies);
-  db.projects = uniqueNames(db.projects);
-  db.expenses.forEach(e => { if (e.company) db.companies.push(e.company); if (e.project) db.projects.push(e.project); });
-  db.companies = uniqueNames(db.companies).sort((a, b) => a.localeCompare(b, "pt-BR"));
-  db.projects = uniqueNames(db.projects).sort((a, b) => a.localeCompare(b, "pt-BR"));
-  if (!db.users.length) db.users = INITIAL_USERS.map(makeUser);
-  db.reports = db.reports.map(r => ({ decisionReason: "", ...r }));
-  return db;
-}
-
-function readDb() {
-  ensureStorage();
-  return migrateDb(JSON.parse(fs.readFileSync(DB_FILE, "utf8")));
-}
-
-function writeDb(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
-
-function nowIso() { return new Date().toISOString(); }
 
 function normalizeMoney(value) {
   if (typeof value === "number") return value;
@@ -88,26 +50,75 @@ function normalizeMoney(value) {
   return Number.isFinite(parsed) ? parsed : NaN;
 }
 
-function formatReportCode(number) {
-  return `Pedido de Reembolso ${String(number).padStart(2, "0")}`;
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  return Object.fromEntries(
+    header.split(";")
+      .map(item => item.trim().split("="))
+      .filter(item => item.length === 2)
+      .map(([k, v]) => [k, decodeURIComponent(v)])
+  );
 }
 
-function expenseDto(expense) {
-  return { ...expense, amount: Number(Number(expense.amount).toFixed(2)) };
+function sessionCookie(token, maxAge) {
+  return [`session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${maxAge}`].join("; ");
 }
 
-function reportDto(report, expenses) {
-  return { ...report, total: Number(Number(report.total).toFixed(2)), expenses: expenses.map(expenseDto) };
+function publicUser(user) {
+  if (!user) return null;
+  return { id: user.id, username: user.username, name: user.name, role: user.role, must_change_password: user.must_change_password };
 }
 
-function userCanSeeExpense(user, expense) {
-  return user.role === "admin" || expense.employeeUserId === user.id || (!expense.employeeUserId && expense.employee === user.name);
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+async function getSessionUser(req) {
+  const auth = req.headers.authorization || "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  const token = bearer || parseCookies(req).session;
+  if (!token) return null;
+  const { rows } = await pool.query(
+    `SELECT u.id, u.username, u.name, u.role, u.must_change_password
+       FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.token = $1 AND s.expires_at > NOW() AND u.active = true`,
+    [token]
+  );
+  return rows[0] || null;
 }
 
-function userCanSeeReport(user, report) {
-  return user.role === "admin" || report.employeeUserId === user.id || (!report.employeeUserId && report.employee === user.name);
+async function requireUser(req, res, next) {
+  const user = await getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Faca login para continuar." });
+  req.user = user;
+  next();
 }
 
+async function requireAdmin(req, res, next) {
+  const user = await getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Faca login para continuar." });
+  if (user.role !== "admin") return res.status(403).json({ error: "Acesso restrito ao administrador." });
+  req.user = user;
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// R2 upload
+// ---------------------------------------------------------------------------
+async function uploadToR2(dataUrl) {
+  if (!dataUrl) return null;
+  const match = /^data:(image\/(png|jpeg|jpg|webp|heic|heif)|application\/pdf);base64,(.+)$/i.exec(dataUrl);
+  if (!match) throw new Error("Envie uma imagem PNG, JPG, WebP, HEIC ou PDF.");
+  const mimeType = match[1].toLowerCase();
+  const ext = mimeType === "application/pdf" ? "pdf" : match[2].toLowerCase() === "jpeg" ? "jpg" : match[2].toLowerCase();
+  const filename = `uploads/${Date.now()}-${crypto.randomBytes(8).toString("hex")}.${ext}`;
+  const buffer = Buffer.from(match[3], "base64");
+  await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: filename, Body: buffer, ContentType: mimeType }));
+  return `${R2_PUBLIC_URL}/${filename}`;
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
 function validateExpense(payload, user) {
   const required = [["supplier","fornecedor"],["date","data"],["amount","valor"],["project","obra"],["company","empresa"],["description","descricao"]];
   for (const [field, label] of required) {
@@ -115,261 +126,317 @@ function validateExpense(payload, user) {
   }
   const amount = normalizeMoney(payload.amount);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("Informe um valor maior que zero.");
-  return { employee: user.name, employeeUserId: user.id, supplier: String(payload.supplier).trim(), date: String(payload.date).trim(), amount, project: String(payload.project).trim(), company: String(payload.company).trim(), description: String(payload.description || "").trim() };
+  return {
+    employee: user.name, employee_user_id: user.id,
+    supplier: String(payload.supplier).trim(), date: String(payload.date).trim(), amount,
+    project: String(payload.project).trim(), company: String(payload.company).trim(),
+    description: String(payload.description || "").trim()
+  };
 }
-
-function addCatalogItem(db, key, name) {
-  const value = String(name || "").trim();
-  if (!value) throw new Error("Informe um nome.");
-  const exists = db[key].some(item => item.toLowerCase() === value.toLowerCase());
-  if (!exists) db[key].push(value);
-  db[key] = uniqueNames(db[key]).sort((a, b) => a.localeCompare(b, "pt-BR"));
-  return value;
-}
-
-function saveImage(dataUrl) {
-  if (!dataUrl) return null;
-  const match = /^data:(image\/(png|jpeg|jpg|webp|heic|heif)|application\/pdf);base64,(.+)$/i.exec(dataUrl);
-  if (!match) throw new Error("Envie uma imagem PNG, JPG, WebP, HEIC ou PDF.");
-  const ext = match[1].toLowerCase() === "application/pdf" ? "pdf" : match[2].toLowerCase() === "jpeg" ? "jpg" : match[2].toLowerCase();
-  const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}.${ext}`;
-  fs.writeFileSync(path.join(UPLOAD_DIR, filename), Buffer.from(match[3], "base64"));
-  return `/uploads/${filename}`;
-}
-
-function publicUser(user) {
-  if (!user) return null;
-  return { id: user.id, username: user.username, name: user.name, role: user.role };
-}
-
-// ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
-function parseCookies(req) {
-  const header = req.headers.cookie || "";
-  return Object.fromEntries(header.split(";").map(i => i.trim().split("=")).filter(i => i.length === 2).map(([k, v]) => [k, decodeURIComponent(v)]));
-}
-
-function sessionCookie(token, maxAge) {
-  return [`session=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Lax", `Max-Age=${maxAge}`].join("; ");
-}
-
-function getCurrentUser(req, db) {
-  const auth = req.headers.authorization || "";
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const token = bearer || parseCookies(req).session;
-  if (!token) return null;
-  const session = db.sessions.find(s => s.token === token && new Date(s.expiresAt).getTime() > Date.now());
-  if (!session) return null;
-  return db.users.find(u => u.id === session.userId) || null;
-}
-
-function requireUser(req, res, next) {
-  const db = readDb();
-  const user = getCurrentUser(req, db);
-  if (!user) return res.status(401).json({ error: "Faca login para continuar." });
-  req.user = user;
-  req.db = db;
-  next();
-}
-
-function requireAdmin(req, res, next) {
-  const db = readDb();
-  const user = getCurrentUser(req, db);
-  if (!user) return res.status(401).json({ error: "Faca login para continuar." });
-  if (user.role !== "admin") return res.status(403).json({ error: "Acesso restrito ao administrador." });
-  req.user = user;
-  req.db = db;
-  next();
-}
-
-// ---------------------------------------------------------------------------
-// App
-// ---------------------------------------------------------------------------
-const app = express();
-app.use(express.json({ limit: "35mb" }));
-app.use(express.static(path.join(__dirname, "public")));
-app.use("/uploads", express.static(UPLOAD_DIR));
 
 // ---------------------------------------------------------------------------
 // Auth routes
 // ---------------------------------------------------------------------------
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   try {
-    const db = readDb();
-    db.sessions = db.sessions.filter(s => new Date(s.expiresAt).getTime() > Date.now());
     const { username = "", password = "" } = req.body;
-    const user = db.users.find(u => u.username.toLowerCase() === username.trim().toLowerCase());
-    if (!user || hashPassword(password, user.passwordSalt) !== user.passwordHash) {
+    const { rows } = await pool.query(
+      "SELECT * FROM users WHERE lower(username) = lower($1) AND active = true",
+      [username.trim()]
+    );
+    const user = rows[0];
+    if (!user || hashPassword(password, user.password_salt) !== user.password_hash) {
       return res.status(401).json({ error: "Usuario ou senha invalidos." });
     }
     const token = crypto.randomBytes(32).toString("hex");
-    db.sessions.push({ token, userId: user.id, createdAt: nowIso(), expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString() });
-    writeDb(db);
+    await pool.query("INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)",
+      [token, user.id, new Date(Date.now() + SESSION_TTL_MS).toISOString()]);
     res.setHeader("Set-Cookie", sessionCookie(token, SESSION_TTL_MS / 1000));
     res.json({ user: publicUser(user), token });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post("/api/logout", (req, res) => {
-  const db = readDb();
+app.post("/api/logout", async (req, res) => {
   const token = parseCookies(req).session;
-  if (token) db.sessions = db.sessions.filter(s => s.token !== token);
-  writeDb(db);
+  if (token) await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
   res.setHeader("Set-Cookie", sessionCookie("", 0));
   res.json({ ok: true });
 });
 
-app.get("/api/session", (req, res) => {
-  const db = readDb();
-  const user = getCurrentUser(req, db);
+app.get("/api/session", async (req, res) => {
+  const user = await getSessionUser(req);
   res.json({ user: publicUser(user) });
+});
+
+app.post("/api/change-password", requireUser, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+    const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+    const user = rows[0];
+    if (!user || hashPassword(current_password, user.password_salt) !== user.password_hash) {
+      return res.status(401).json({ error: "Senha atual incorreta." });
+    }
+    if (!new_password || new_password.length < 6) {
+      return res.status(400).json({ error: "Nova senha deve ter pelo menos 6 caracteres." });
+    }
+    const salt = crypto.randomBytes(12).toString("hex");
+    const hash = hashPassword(new_password, salt);
+    await pool.query("UPDATE users SET password_salt=$1, password_hash=$2, must_change_password=false WHERE id=$3",
+      [salt, hash, req.user.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
-app.get("/api/bootstrap", requireUser, (req, res) => {
-  const db = req.db;
-  const user = req.user;
-  const reports = db.reports
-    .filter(r => userCanSeeReport(user, r))
-    .map(r => reportDto(r, db.expenses.filter(e => e.reportId === r.id)))
-    .sort((a, b) => b.number - a.number);
+app.get("/api/bootstrap", requireUser, async (req, res) => {
+  try {
+    const user = req.user;
+    const [companies, projects, drafts, reports] = await Promise.all([
+      pool.query("SELECT name FROM companies ORDER BY name"),
+      pool.query("SELECT name FROM projects ORDER BY name"),
+      pool.query(`SELECT * FROM expenses WHERE status = 'draft' AND ($1 = 'admin' OR employee_user_id = $2) ORDER BY created_at`, [user.role, user.id]),
+      pool.query(`SELECT r.*, COALESCE(json_agg(e.* ORDER BY e.number) FILTER (WHERE e.id IS NOT NULL), '[]') AS expenses
+                    FROM reports r LEFT JOIN expenses e ON e.report_id = r.id
+                   WHERE $1 = 'admin' OR r.employee_user_id = $2
+                   GROUP BY r.id ORDER BY r.number DESC`, [user.role, user.id])
+    ]);
+    res.json({
+      user: publicUser(user),
+      companies: companies.rows.map(r => r.name),
+      projects: projects.rows.map(r => r.name),
+      draftExpenses: drafts.rows,
+      reports: reports.rows
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-  res.json({
-    user: publicUser(user),
-    companies: db.companies,
-    projects: db.projects,
-    nextReportCode: formatReportCode(db.nextReportNumber),
-    draftExpenses: db.expenses.filter(e => e.status === "draft" && userCanSeeExpense(user, e)).map(expenseDto),
-    reports
-  });
+// ---------------------------------------------------------------------------
+// Users (admin only)
+// ---------------------------------------------------------------------------
+app.get("/api/users", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT id, username, name, role, active, must_change_password, created_at FROM users ORDER BY name");
+    res.json({ users: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/users", requireAdmin, async (req, res) => {
+  try {
+    const { name, username, role = "employee" } = req.body;
+    if (!name || !username) return res.status(400).json({ error: "Informe nome e usuario." });
+    if (!["admin", "employee"].includes(role)) return res.status(400).json({ error: "Papel invalido." });
+
+    const tempPassword = `${username.toLowerCase()}123`;
+    const salt = crypto.randomBytes(12).toString("hex");
+    const hash = hashPassword(tempPassword, salt);
+
+    const { rows } = await pool.query(
+      `INSERT INTO users (id, username, name, role, password_salt, password_hash, active, must_change_password, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, true, true, $7) RETURNING id, username, name, role, active, must_change_password, created_at`,
+      [crypto.randomUUID(), username.trim().toLowerCase(), name.trim(), role, salt, hash, nowIso()]
+    );
+    res.status(201).json({ user: rows[0] });
+  } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ error: "Nome de usuario ja existe." });
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch("/api/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, username, role, active } = req.body;
+    const updates = [];
+    const values = [];
+    let i = 1;
+
+    if (name !== undefined) { updates.push(`name=$${i++}`); values.push(name.trim()); }
+    if (username !== undefined) { updates.push(`username=$${i++}`); values.push(username.trim().toLowerCase()); }
+    if (role !== undefined) {
+      if (!["admin", "employee"].includes(role)) return res.status(400).json({ error: "Papel invalido." });
+      updates.push(`role=$${i++}`); values.push(role);
+    }
+    if (active !== undefined) { updates.push(`active=$${i++}`); values.push(active); }
+
+    if (!updates.length) return res.status(400).json({ error: "Nenhum campo para atualizar." });
+    values.push(req.params.id);
+
+    const { rows } = await pool.query(
+      `UPDATE users SET ${updates.join(", ")} WHERE id=$${i} RETURNING id, username, name, role, active, must_change_password, created_at`,
+      values
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Usuario nao encontrado." });
+    res.json({ user: rows[0] });
+  } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ error: "Nome de usuario ja existe." });
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete("/api/users/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.params.id === req.user.id) return res.status(400).json({ error: "Voce nao pode apagar sua propria conta." });
+    await pool.query("DELETE FROM sessions WHERE user_id = $1", [req.params.id]);
+    const { rowCount } = await pool.query("DELETE FROM users WHERE id = $1", [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: "Usuario nao encontrado." });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/api/users/:id/reset-password", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM users WHERE id = $1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Usuario nao encontrado." });
+    const tempPassword = `${rows[0].username}123`;
+    const salt = crypto.randomBytes(12).toString("hex");
+    const hash = hashPassword(tempPassword, salt);
+    await pool.query("UPDATE users SET password_salt=$1, password_hash=$2, must_change_password=true WHERE id=$3", [salt, hash, req.params.id]);
+    res.json({ ok: true, temp_password: tempPassword });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ---------------------------------------------------------------------------
 // Catalog
 // ---------------------------------------------------------------------------
-app.post("/api/companies", requireUser, (req, res) => {
+app.post("/api/companies", requireUser, async (req, res) => {
   try {
-    const db = req.db;
-    const name = addCatalogItem(db, "companies", req.body.name);
-    writeDb(db);
-    res.status(201).json({ name, companies: db.companies });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Informe um nome." });
+    await pool.query("INSERT INTO companies (name) VALUES ($1) ON CONFLICT (lower(name)) DO NOTHING", [name]);
+    const { rows } = await pool.query("SELECT name FROM companies ORDER BY name");
+    res.status(201).json({ name, companies: rows.map(r => r.name) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post("/api/projects", requireUser, (req, res) => {
+app.post("/api/projects", requireUser, async (req, res) => {
   try {
-    const db = req.db;
-    const name = addCatalogItem(db, "projects", req.body.name);
-    writeDb(db);
-    res.status(201).json({ name, projects: db.projects });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+    const name = String(req.body.name || "").trim();
+    if (!name) return res.status(400).json({ error: "Informe um nome." });
+    await pool.query("INSERT INTO projects (name) VALUES ($1) ON CONFLICT (lower(name)) DO NOTHING", [name]);
+    const { rows } = await pool.query("SELECT name FROM projects ORDER BY name");
+    res.status(201).json({ name, projects: rows.map(r => r.name) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // ---------------------------------------------------------------------------
 // Expenses
 // ---------------------------------------------------------------------------
-app.post("/api/expenses", requireUser, (req, res) => {
+app.post("/api/expenses", requireUser, async (req, res) => {
   try {
-    const db = req.db;
     const fields = validateExpense(req.body, req.user);
-    const imageUrl = saveImage(req.body.imageDataUrl);
-    addCatalogItem(db, "companies", fields.company);
-    addCatalogItem(db, "projects", fields.project);
-    const expense = { id: crypto.randomUUID(), number: db.nextExpenseNumber++, ...fields, imageUrl, status: "draft", reportId: null, createdAt: nowIso(), updatedAt: nowIso() };
-    db.expenses.push(expense);
-    writeDb(db);
-    res.status(201).json({ expense: expenseDto(expense), companies: db.companies, projects: db.projects });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+    const imageUrl = await uploadToR2(req.body.imageDataUrl);
+    await pool.query("INSERT INTO companies (name) VALUES ($1) ON CONFLICT (lower(name)) DO NOTHING", [fields.company]);
+    await pool.query("INSERT INTO projects (name) VALUES ($1) ON CONFLICT (lower(name)) DO NOTHING", [fields.project]);
+    const { rows } = await pool.query(
+      `INSERT INTO expenses (id, number, employee, employee_user_id, supplier, date, amount, project, company, description, image_url, status, report_id, created_at, updated_at)
+       VALUES ($1, nextval('expense_number_seq'), $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', NULL, $11, $11) RETURNING *`,
+      [crypto.randomUUID(), fields.employee, fields.employee_user_id, fields.supplier, fields.date, fields.amount, fields.project, fields.company, fields.description, imageUrl, nowIso()]
+    );
+    const [companies, projects] = await Promise.all([
+      pool.query("SELECT name FROM companies ORDER BY name"),
+      pool.query("SELECT name FROM projects ORDER BY name")
+    ]);
+    res.status(201).json({ expense: rows[0], companies: companies.rows.map(r => r.name), projects: projects.rows.map(r => r.name) });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.delete("/api/expenses/:id", requireUser, (req, res) => {
-  const db = req.db;
-  const expense = db.expenses.find(e => e.id === req.params.id);
-  if (!expense) return res.status(404).json({ error: "Despesa nao encontrada." });
-  if (!userCanSeeExpense(req.user, expense)) return res.status(403).json({ error: "Voce nao pode remover esta despesa." });
-  if (expense.status !== "draft") return res.status(409).json({ error: "Despesa ja enviada nao pode ser removida." });
-  db.expenses = db.expenses.filter(e => e.id !== expense.id);
-  writeDb(db);
-  res.json({ ok: true });
+app.delete("/api/expenses/:id", requireUser, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM expenses WHERE id = $1", [req.params.id]);
+    const expense = rows[0];
+    if (!expense) return res.status(404).json({ error: "Despesa nao encontrada." });
+    const canSee = req.user.role === "admin" || expense.employee_user_id === req.user.id;
+    if (!canSee) return res.status(403).json({ error: "Voce nao pode remover esta despesa." });
+    if (expense.status !== "draft") return res.status(409).json({ error: "Despesa ja enviada nao pode ser removida." });
+    await pool.query("DELETE FROM expenses WHERE id = $1", [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
-app.post("/api/reports", requireUser, (req, res) => {
-  const db = req.db;
-  const user = req.user;
-  const draftExpenses = db.expenses.filter(e => e.status === "draft" && userCanSeeExpense(user, e));
-  if (!draftExpenses.length) return res.status(400).json({ error: "Nao ha despesas em aberto para este usuario." });
-
-  const returnedReport = db.reports.find(r =>
-    r.status === "returned" && userCanSeeReport(user, r) && draftExpenses.some(e => e.reportId === r.id)
-  );
-
-  const report = returnedReport || {
-    id: crypto.randomUUID(), number: db.nextReportNumber++,
-    code: formatReportCode(db.nextReportNumber - 1),
-    employee: user.name, employeeUserId: user.id,
-    status: "pending", total: 0, decisionReason: "",
-    createdAt: nowIso(), updatedAt: nowIso()
-  };
-
-  report.employee = user.name;
-  report.employeeUserId = user.id;
-  report.status = "pending";
-  report.total = draftExpenses.reduce((sum, e) => sum + e.amount, 0);
-  report.decisionReason = "";
-  report.updatedAt = nowIso();
-
-  draftExpenses.forEach(e => { e.status = "submitted"; e.reportId = report.id; e.updatedAt = nowIso(); });
-  if (!returnedReport) db.reports.push(report);
-  writeDb(db);
-  res.status(201).json({ report: reportDto(report, draftExpenses) });
-});
-
-app.patch("/api/reports/:id", requireAdmin, (req, res) => {
+app.post("/api/reports", requireUser, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const db = req.db;
-    const report = db.reports.find(r => r.id === req.params.id);
-    if (!report) return res.status(404).json({ error: "Pedido nao encontrado." });
+    await client.query("BEGIN");
+    const user = req.user;
+    const { rows: drafts } = await client.query(
+      `SELECT * FROM expenses WHERE status = 'draft' AND ($1 = 'admin' OR employee_user_id = $2)`,
+      [user.role, user.id]
+    );
+    if (!drafts.length) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Nao ha despesas em aberto para este usuario." }); }
 
-    const { status, reason } = req.body;
-    const allowed = ["pending", "approved", "returned"];
-    if (!allowed.includes(status)) return res.status(400).json({ error: "Status invalido." });
-    if (status === "returned" && !String(reason || "").trim()) return res.status(400).json({ error: "Informe o motivo." });
-
-    report.status = status;
-    report.decisionReason = status === "returned" ? String(reason).trim() : "";
-    report.updatedAt = nowIso();
-
-    if (status === "returned") {
-      db.expenses.filter(e => e.reportId === report.id).forEach(e => { e.status = "draft"; e.updatedAt = nowIso(); });
+    const draftIds = drafts.map(e => e.report_id).filter(Boolean);
+    let report = null;
+    if (draftIds.length) {
+      const { rows: returned } = await client.query(
+        `SELECT * FROM reports WHERE status = 'returned' AND id = ANY($1) AND employee_user_id = $2 LIMIT 1`,
+        [draftIds, user.id]
+      );
+      report = returned[0] || null;
     }
 
-    writeDb(db);
-    res.json({ report: reportDto(report, db.expenses.filter(e => e.reportId === report.id)) });
+    const total = drafts.reduce((sum, e) => sum + Number(e.amount), 0);
+
+    if (report) {
+      await client.query(`UPDATE reports SET status='pending', total=$1, decision_reason='', updated_at=$2 WHERE id=$3`, [total, nowIso(), report.id]);
+    } else {
+      const number = (await client.query("SELECT nextval('report_number_seq') AS n")).rows[0].n;
+      const id = crypto.randomUUID();
+      await client.query(
+        `INSERT INTO reports (id, number, code, employee, employee_user_id, status, total, decision_reason, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,'pending',$6,'',$7,$7)`,
+        [id, number, formatReportCode(number), user.name, user.id, total, nowIso()]
+      );
+      report = (await client.query("SELECT * FROM reports WHERE id = $1", [id])).rows[0];
+    }
+
+    await client.query(
+      `UPDATE expenses SET status='submitted', report_id=$1, updated_at=$2 WHERE status='draft' AND ($3 = 'admin' OR employee_user_id = $4)`,
+      [report.id, nowIso(), user.role, user.id]
+    );
+    await client.query("COMMIT");
+    const { rows: expenses } = await pool.query("SELECT * FROM expenses WHERE report_id = $1", [report.id]);
+    res.status(201).json({ report: { ...report, expenses } });
   } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+app.patch("/api/reports/:id", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { status, reason } = req.body;
+    const { rows } = await client.query("SELECT * FROM reports WHERE id = $1", [req.params.id]);
+    if (!rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Pedido nao encontrado." }); }
+    const allowed = ["pending", "approved", "returned"];
+    if (!allowed.includes(status)) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Status invalido." }); }
+    if (status === "returned" && !String(reason || "").trim()) { await client.query("ROLLBACK"); return res.status(400).json({ error: "Informe o motivo." }); }
+    const decisionReason = status === "returned" ? String(reason).trim() : "";
+    await client.query("UPDATE reports SET status=$1, decision_reason=$2, updated_at=$3 WHERE id=$4", [status, decisionReason, nowIso(), req.params.id]);
+    if (status === "returned") {
+      await client.query("UPDATE expenses SET status='draft', updated_at=$1 WHERE report_id=$2", [nowIso(), req.params.id]);
+    }
+    await client.query("COMMIT");
+    const { rows: updated } = await pool.query("SELECT * FROM reports WHERE id = $1", [req.params.id]);
+    const { rows: expenses } = await pool.query("SELECT * FROM expenses WHERE report_id = $1", [req.params.id]);
+    res.json({ report: { ...updated[0], expenses } });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 // ---------------------------------------------------------------------------
-// Start
+// Fallback SPA
 // ---------------------------------------------------------------------------
-ensureStorage();
-writeDb(readDb());
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Caixinha Reembolso (local) rodando em http://localhost:${PORT}`);
+  console.log(`Caixinha Reembolso rodando em http://localhost:${PORT}`);
 });

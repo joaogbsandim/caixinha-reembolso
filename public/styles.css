@@ -838,3 +838,41 @@ summary {
     border-top: 1px solid var(--line);
   }
 }
+
+/* Drag and drop */
+.drop-zone {
+  cursor: pointer;
+  transition: border-color 160ms, background 160ms;
+}
+
+.drop-zone.drag-over {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+/* Users */
+.user-item {
+  align-items: center;
+}
+
+.user-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.user-actions .button {
+  min-height: 36px;
+  font-size: 0.82rem;
+  padding: 0 12px;
+}
+
+.status.inactive {
+  color: var(--danger);
+}
+
+#usersView.is-active {
+  grid-template-columns: 1fr;
+}

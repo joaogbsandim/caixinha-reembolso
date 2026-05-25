@@ -20,7 +20,7 @@
         </div>
         <label class="field">
           <span>Usuario</span>
-          <input name="username" autocomplete="username" placeholder="admin ou colaborador" required>
+          <input name="username" autocomplete="username" placeholder="usuario" required>
         </label>
         <label class="field">
           <span>Senha</span>
@@ -28,6 +28,34 @@
         </label>
         <p class="form-message" id="loginMessage"></p>
         <button class="button primary full" type="submit">Entrar</button>
+      </form>
+    </section>
+
+    <!-- Tela de troca de senha obrigatória -->
+    <section class="auth-screen is-hidden" id="changePasswordScreen" hidden>
+      <form class="auth-card" id="changePasswordForm">
+        <div class="brand-lockup login-brand">
+          <img class="brand-logo-large" src="/logo-cobase.png" alt="Cobase Engenharia">
+          <div>
+            <p class="eyebrow">Cobase</p>
+            <h1>Alterar senha</h1>
+          </div>
+        </div>
+        <p style="color:var(--muted);font-size:0.9rem;">Este e seu primeiro acesso. Por seguranca, defina uma nova senha.</p>
+        <label class="field">
+          <span>Senha atual</span>
+          <input name="current_password" type="password" autocomplete="current-password" required>
+        </label>
+        <label class="field">
+          <span>Nova senha</span>
+          <input name="new_password" type="password" autocomplete="new-password" minlength="6" required>
+        </label>
+        <label class="field">
+          <span>Confirmar nova senha</span>
+          <input name="confirm_password" type="password" autocomplete="new-password" minlength="6" required>
+        </label>
+        <p class="form-message" id="changePasswordMessage"></p>
+        <button class="button primary full" type="submit">Salvar nova senha</button>
       </form>
     </section>
 
@@ -45,30 +73,30 @@
             <strong id="userName">...</strong>
             <span id="userRole">...</span>
           </div>
-          <button class="button top-action" id="logoutButton" type="button" title="Sair">Sair</button>
+          <button class="button top-action" id="logoutButton" type="button">Sair</button>
         </div>
       </header>
 
       <nav class="tabs" aria-label="Areas do sistema">
         <button class="tab is-active employee-only" type="button" data-view="employeeView">
-          <span class="icon">+</span>
-          Lancar
+          <span class="icon">+</span> Lancar
         </button>
         <button class="tab employee-only" type="button" data-view="reportsView">
-          <span class="icon">#</span>
-          Em aberto
+          <span class="icon">#</span> Em aberto
         </button>
         <button class="tab admin-only" type="button" data-view="adminView">
-          <span class="icon">OK</span>
-          Gestao
+          <span class="icon">OK</span> Gestao
         </button>
         <button class="tab" type="button" data-view="approvedView">
-          <span class="icon">✓</span>
-          Aprovados
+          <span class="icon">✓</span> Aprovados
+        </button>
+        <button class="tab admin-only" type="button" data-view="usersView">
+          <span class="icon">👤</span> Usuarios
         </button>
       </nav>
 
       <main>
+        <!-- Lancar -->
         <section class="view is-active employee-only" id="employeeView">
           <form class="panel expense-form" id="expenseForm">
             <div class="section-title">
@@ -79,28 +107,25 @@
             <div class="field field-full">
               <label class="button ghost file-button single-file-button">
                 Anexar comprovante
-                <input id="receiptInput" name="receiptFile" type="file" accept="image/*,application/pdf" required>
+                <input id="receiptInput" name="receiptFile" type="file" accept="image/*,application/pdf">
               </label>
             </div>
-            <div class="receipt-preview" id="receiptPreview">
-              <span>Sem foto</span>
+            <div class="receipt-preview drop-zone" id="receiptPreview">
+              <span>Arraste ou clique para anexar</span>
             </div>
 
             <label class="field">
               <span>Fornecedor</span>
               <input name="supplier" placeholder="Ex.: Posto, mercado, loja" required>
             </label>
-
             <label class="field">
               <span>Data</span>
               <input name="date" type="date" required>
             </label>
-
             <label class="field">
               <span>Valor</span>
               <input name="amount" inputmode="decimal" placeholder="0,00" required>
             </label>
-
             <div class="field">
               <span>Empresa</span>
               <div class="select-action">
@@ -109,7 +134,6 @@
                 <button class="icon-button add-catalog" type="button" data-kind="company" title="Adicionar empresa">+</button>
               </div>
             </div>
-
             <div class="field field-full">
               <span>Obra</span>
               <div class="select-action">
@@ -118,16 +142,13 @@
                 <button class="icon-button add-catalog" type="button" data-kind="project" title="Adicionar obra">+</button>
               </div>
             </div>
-
             <label class="field field-full">
               <span>Descricao</span>
               <textarea name="description" rows="3" placeholder="Motivo do gasto" required></textarea>
             </label>
-
             <div class="actions">
               <button class="button primary" type="submit">
-                <span class="icon">+</span>
-                Adicionar ao relatorio
+                <span class="icon">+</span> Adicionar ao relatorio
               </button>
             </div>
           </form>
@@ -144,6 +165,7 @@
           </section>
         </section>
 
+        <!-- Em aberto -->
         <section class="view" id="reportsView">
           <section class="panel">
             <div class="section-title">
@@ -154,6 +176,7 @@
           </section>
         </section>
 
+        <!-- Gestao -->
         <section class="view" id="adminView">
           <section class="panel">
             <div class="section-title">
@@ -164,6 +187,7 @@
           </section>
         </section>
 
+        <!-- Aprovados -->
         <section class="view" id="approvedView">
           <section class="panel">
             <div class="section-title">
@@ -173,15 +197,28 @@
             <div class="list" id="approvedList"></div>
           </section>
         </section>
+
+        <!-- Usuarios -->
+        <section class="view" id="usersView">
+          <section class="panel">
+            <div class="section-title">
+              <h2>Usuarios</h2>
+              <button class="button primary" id="newUserButton" type="button">+ Novo usuario</button>
+            </div>
+            <div class="list" id="userList"></div>
+          </section>
+        </section>
       </main>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <div class="modal-backdrop is-hidden" id="catalogModal" role="dialog" aria-modal="true" aria-labelledby="catalogTitle" hidden>
+
+    <!-- Modal catalogo -->
+    <div class="modal-backdrop is-hidden" id="catalogModal" role="dialog" aria-modal="true" hidden>
       <form class="modal-card" id="catalogForm">
         <div class="section-title">
           <h2 id="catalogTitle">Novo cadastro</h2>
-          <button class="icon-button" id="catalogCloseButton" type="button" title="Fechar">x</button>
+          <button class="icon-button" id="catalogCloseButton" type="button">x</button>
         </div>
         <label class="field">
           <span id="catalogLabel">Nome</span>
@@ -193,11 +230,13 @@
         </div>
       </form>
     </div>
-    <div class="modal-backdrop is-hidden" id="decisionModal" role="dialog" aria-modal="true" aria-labelledby="decisionTitle" hidden>
+
+    <!-- Modal decisao -->
+    <div class="modal-backdrop is-hidden" id="decisionModal" role="dialog" aria-modal="true" hidden>
       <form class="modal-card" id="decisionForm">
         <div class="section-title">
           <h2 id="decisionTitle">Motivo</h2>
-          <button class="icon-button" id="decisionCloseButton" type="button" title="Fechar">x</button>
+          <button class="icon-button" id="decisionCloseButton" type="button">x</button>
         </div>
         <label class="field">
           <span id="decisionLabel">Explique o motivo</span>
@@ -210,14 +249,41 @@
       </form>
     </div>
 
+    <!-- Modal usuario -->
+    <div class="modal-backdrop is-hidden" id="userModal" role="dialog" aria-modal="true" hidden>
+      <form class="modal-card" id="userForm">
+        <div class="section-title">
+          <h2 id="userModalTitle">Novo usuario</h2>
+          <button class="icon-button" id="userModalClose" type="button">x</button>
+        </div>
+        <label class="field">
+          <span>Nome completo</span>
+          <input id="userNameInput" name="name" autocomplete="off" required>
+        </label>
+        <label class="field">
+          <span>Usuario (login)</span>
+          <input id="userUsernameInput" name="username" autocomplete="off" required>
+        </label>
+        <div class="field">
+          <span>Papel</span>
+          <select id="userRoleInput" name="role">
+            <option value="employee">Colaborador</option>
+            <option value="admin">Administrador</option>
+          </select>
+        </div>
+        <p class="form-message" id="userModalMessage"></p>
+        <div class="actions">
+          <button class="button ghost" id="userModalCancel" type="button">Cancelar</button>
+          <button class="button primary" type="submit" id="userModalSubmit">Salvar</button>
+        </div>
+      </form>
+    </div>
+
     <template id="expenseTemplate">
       <article class="item expense-item">
         <img class="thumb" alt="Comprovante">
         <div class="item-body">
-          <div class="item-head">
-            <strong></strong>
-            <span></span>
-          </div>
+          <div class="item-head"><strong></strong><span></span></div>
           <p></p>
           <small></small>
         </div>
@@ -228,10 +294,7 @@
     <template id="reportTemplate">
       <article class="item report-item">
         <div class="item-body">
-          <div class="item-head">
-            <strong></strong>
-            <span class="status"></span>
-          </div>
+          <div class="item-head"><strong></strong><span class="status"></span></div>
           <p></p>
           <small></small>
           <details>
