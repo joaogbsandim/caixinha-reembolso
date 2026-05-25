@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 250" role="img" aria-label="Cobase Engenharia">
+  <rect width="250" height="250" rx="0" fill="#383f56"/>
+  <g transform="translate(79 50)" fill="none" stroke="#cecd39" stroke-width="7" stroke-linejoin="round">
+    <path d="M33 12h42v42H33z"/>
+    <path d="M47 0h42v42H47z"/>
+  </g>
+  <text x="125" y="145" text-anchor="middle" font-family="Century Gothic, Arial, sans-serif" font-size="42" fill="#fff" letter-spacing="-1">cobase</text>
+  <text x="125" y="170" text-anchor="middle" font-family="Century Gothic, Arial, sans-serif" font-size="13" fill="#fff" letter-spacing="4">ENGENHARIA</text>
+</svg>
